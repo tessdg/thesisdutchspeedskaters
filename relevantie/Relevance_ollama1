@@ -1,0 +1,260 @@
+"""
+Step 2: Classify each comment as RELEVANT or NOT RELEVANT using a local
+LLM via Ollama.
+
+A comment is RELEVANT if it is about:
+  - the speedskater themselves (personality, behaviour, appearance,
+    public life), OR
+  - their performance (a race, a result, their training, a competition).
+
+NOT RELEVANT covers everything else: a different person with the same
+name (e.g. Thomas Müller the footballer vs Thomas Krol the speedskater),
+generic off-topic chat, jokes that don't refer to the skater, etc.
+
+Why a local model:
+  - No API cost, fully reproducible for thesis methodology
+  - Runs fine on M2 16GB
+
+Recommended model:
+  ollama pull qwen2.5:7b-instruct   # first choice, strong at JSON output
+
+  
+  ollama pull llama3.1:8b            # second choice
+"""
+
+import json
+import time
+import re
+import sys
+from pathlib import Path
+
+import pandas as pd
+import requests
+from tqdm import tqdm
+
+# ---- CONFIG -----------------------------------------------------------------
+_HERE        = Path(__file__).parent
+INPUT_CSV    = _HERE / ".." / "comments_all_clean.csv"
+OUTPUT_CSV   = _HERE / "classified_opus.csv"
+PROGRESS_CSV = _HERE / "classified_partial.csv"
+
+MODEL        = "qwen2.5:7b-instruct"     # change to llama3.1:8b if you prefer
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+
+SAVE_EVERY   = 100           # checkpoint every N comments
+MAX_RETRIES  = 2             # per comment, on parse/HTTP failure
+REQUEST_TIMEOUT = 120        # seconds
+
+# Full names per skater (for the prompt). Tune nicknames here.
+SKATER_FULL = {
+    "sven":   "Sven Kramer (Dutch long-track speed skater)",
+    "ireen":  "Ireen Wüst (Dutch long-track speed skater)",
+    "jutta":  "Jutta Leerdam (Dutch long-track speed skater)",
+    "kjeld":  "Kjeld Nuis (Dutch long-track speed skater)",
+    "thomas": "Thomas Krol (Dutch long-track speed skater) — NOT Thomas Müller the footballer",
+    "femke":  "Femke Kok (Dutch long-track speed skater)",
+}
+
+# ---- PROMPT -----------------------------------------------------------------
+SYSTEM = """You are a research assistant labelling Reddit comments for a thesis on Dutch speed skaters.
+
+For each comment, decide if it is RELEVANT to the TARGET SKATER named in the input.
+
+A comment is RELEVANT if it is about:
+  (a) the target skater as a person (personality, looks, behaviour, private life, fans, relationships), OR
+  (b) the target skater's sport performance (a race, training, result, competition, career, technique).
+
+IMPORTANT RULE — THREAD CONTEXT:
+The thread title tells you what the thread is about. If the thread is clearly about the target skater (e.g. "Femke Kok wins Gold"), then a comment posted in that thread is RELEVANT when it is reacting to that topic — even when:
+  - the comment is very short ("Mooi", "Insane run", "Wow", "She is incredible")
+  - the comment does NOT repeat the skater's name
+  - the comment mentions OTHER people for comparison ("reminds me of X's race")
+  - the comment uses pronouns ("she", "her", "he")
+  - the comment expresses an emotion or reaction without explanation
+
+A comment is NOT_RELEVANT only when it is clearly off-topic from the thread (random side-conversation, sub-thread bickering, jokes unconnected to the skater, posts about a totally different person).
+
+A comment is NOT_RELEVANT if it is PRIMARILY about:
+  - a different person who happens to share a name (very common: footballers, other athletes)
+  - unrelated topics, sub-thread arguments between two users
+  - the subreddit topic in general but not this skater (e.g. football in r/soccer)
+
+Mentioning another person for comparison does NOT make a comment irrelevant. What matters is whether the comment is RESPONDING TO or ABOUT the target skater in context.
+
+Output ONLY a JSON object, no other text:
+{"label": "RELEVANT" or "NOT_RELEVANT", "confidence": "high" or "medium" or "low", "reason": "short phrase, max 12 words"}
+"""
+
+FEW_SHOT = """Here are some examples of correct labelling.
+
+Example 1 (short reaction in clearly-about-skater thread → RELEVANT):
+Target skater: Femke Kok (Dutch long-track speed skater)
+Thread title: Femke Kok wins Gold for Netherlands in Women's 500m Speed Skating
+Subreddit: r/olympics
+Comment: Mooi
+JSON: {"label": "RELEVANT", "confidence": "high", "reason": "positive reaction to her gold-medal race"}
+
+Example 2 (mentions another skater for comparison but praises target's race → RELEVANT):
+Target skater: Femke Kok (Dutch long-track speed skater)
+Thread title: Jutta Leerdam verovert olympisch goud op 1.000 meter, zilver voor Femke Kok
+Subreddit: r/thenetherlands
+Comment: Wat een mooie race! Geweldige TV. Doet me aan Gerard van Velde zijn gouden race denken.
+JSON: {"label": "RELEVANT", "confidence": "high", "reason": "praises the race; mentions van Velde only as comparison"}
+
+Example 3 (name collision, comment is about a different person → NOT_RELEVANT):
+Target skater: Thomas Krol (Dutch long-track speed skater)
+Thread title: Match Thread: Bayern Munich vs Borussia Monchengladbach
+Subreddit: r/soccer
+Comment: Bayern is completely different team without Muller and Lewandowski
+JSON: {"label": "NOT_RELEVANT", "confidence": "high", "reason": "about footballer Thomas Müller, not Thomas Krol"}
+
+Example 4 (sub-thread argument unrelated to skater → NOT_RELEVANT):
+Target skater: Femke Kok (Dutch long-track speed skater)
+Thread title: Jutta Leerdam verovert olympisch goud op 1.000 meter, zilver voor Femke Kok
+Subreddit: r/thenetherlands
+Comment: Begrijpend lezen blijkt bij deze voor mij te hoog gegrepen zijn haha
+JSON: {"label": "NOT_RELEVANT", "confidence": "high", "reason": "sub-thread bickering about reading comprehension"}
+
+Example 5 (short emotional reaction in skater's gif thread → RELEVANT):
+Target skater: Jutta Leerdam (Dutch long-track speed skater)
+Thread title: Jutta leerdam Dutch speed skater
+Subreddit: r/gifs
+Comment: I think I just feel in love
+JSON: {"label": "RELEVANT", "confidence": "high", "reason": "fan reaction to the skater"}
+
+Now label the next comment.
+"""
+
+USER_TEMPLATE = """Target skater: {skater}
+Thread title: {thread}
+Subreddit: r/{subreddit}
+Comment: {comment}
+
+JSON:"""
+
+# ---- OLLAMA CALL ------------------------------------------------------------
+def call_ollama(prompt: str) -> str:
+    """Single non-streaming request. Returns raw model text."""
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "system": SYSTEM,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,    # deterministic for reproducibility
+            "num_predict": 120,    # plenty for our small JSON
+        },
+        "format": "json",          # Ollama-side JSON mode; very helpful
+    }
+    r = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["response"]
+
+def parse_response(text: str) -> dict:
+    """Robust JSON parse. Models sometimes wrap output in fences or add prose."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try to extract first {...} block
+    m = re.search(r"\{.*?\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"Could not parse JSON from: {text[:200]}")
+
+def classify_row(row) -> dict:
+    """Build prompt for one comment, call model, parse."""
+    skater = SKATER_FULL.get(row["persoon"], row["persoon"])
+    # Truncate very long comments so prompt stays small
+    comment = str(row["comment"])[:1500]
+    thread  = str(row["thread_title"])[:300]
+    prompt = FEW_SHOT + USER_TEMPLATE.format(
+        skater=skater,
+        thread=thread,
+        subreddit=row["subreddit"],
+        comment=comment,
+    )
+
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            raw = call_ollama(prompt)
+            parsed = parse_response(raw)
+            label = str(parsed.get("label", "")).upper().strip()
+            if label not in ("RELEVANT", "NOT_RELEVANT"):
+                raise ValueError(f"Bad label: {label!r}")
+            return {
+                "label":      label,
+                "confidence": str(parsed.get("confidence", "")).lower(),
+                "reason":     str(parsed.get("reason", ""))[:200],
+                "raw":        raw[:300],
+            }
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+    # Give up gracefully — mark as ERROR, don't crash the whole run
+    return {
+        "label": "ERROR",
+        "confidence": "",
+        "reason": f"parse_fail: {last_err}"[:200],
+        "raw": "",
+    }
+
+# ---- MAIN -------------------------------------------------------------------
+def main():
+    # Quick connectivity check
+    try:
+        requests.get("http://localhost:11434/", timeout=3)
+    except Exception:
+        sys.exit("Ollama is not reachable at localhost:11434. Run `ollama serve` first.")
+
+    df = pd.read_csv(INPUT_CSV)
+    print(f"Loaded {len(df):,} comments to classify with {MODEL}")
+
+    # Resume if a partial file exists
+    if Path(PROGRESS_CSV).exists():
+        done = pd.read_csv(PROGRESS_CSV)
+        already = set(done["comment_id"].astype(str))
+        df = df[~df["comment_id"].astype(str).isin(already)]
+        results = done.to_dict("records")
+        print(f"Resuming: {len(already):,} already done, {len(df):,} remaining")
+    else:
+        results = []
+
+    try:
+        for i, row in enumerate(tqdm(df.itertuples(index=False), total=len(df))):
+            row_dict = row._asdict()
+            out = classify_row(row_dict)
+            results.append({
+                "comment_id":     row_dict["comment_id"],
+                "persoon":        row_dict["persoon"],
+                "label":          out["label"],
+                "confidence":     out["confidence"],
+                "reason":         out["reason"],
+                "raw":            out["raw"],
+            })
+            if (i + 1) % SAVE_EVERY == 0:
+                pd.DataFrame(results).to_csv(PROGRESS_CSV, index=False)
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving progress so far...")
+
+    res_df = pd.DataFrame(results)
+    res_df.to_csv(PROGRESS_CSV, index=False)
+
+    # Merge labels back onto the prefiltered data
+    full = pd.read_csv(INPUT_CSV)
+    merged = full.merge(res_df, on=["comment_id", "persoon"], how="left")
+    merged.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nDone. Wrote {OUTPUT_CSV}")
+    print("\nLabel counts:")
+    print(merged["label"].value_counts(dropna=False))
+    print("\nLabel by skater:")
+    print(merged.groupby("persoon")["label"].value_counts().unstack(fill_value=0))
+
+if __name__ == "__main__":
+    main()

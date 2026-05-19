@@ -1,0 +1,82 @@
+from transformers import pipeline
+import pandas as pd
+
+# Model laden
+print("Model laden...")
+sentiment_model = pipeline(
+    "sentiment-analysis", 
+    model="cardiffnlp/twitter-xlm-roberta-base-sentiment",
+    tokenizer="cardiffnlp/twitter-xlm-roberta-base-sentiment"
+)
+print("Model geladen!")
+
+# CSV inladen
+df_comments = pd.read_csv("/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_relevant.csv")
+print(f"Analyseren van {len(df_comments)} comments...")
+
+# Sentiment functie
+def get_sentiment(text):
+    try:
+        text = str(text)[:500]
+        result = sentiment_model(text)[0]
+        return result["label"].lower()
+    except:
+        return "unknown"
+
+# Checkpoint
+checkpoint_file = "/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/sentiment_checkpoint.csv"
+
+try:
+    checkpoint = pd.read_csv(checkpoint_file)
+    df_comments["sentiment"] = checkpoint["sentiment"]
+    start_i = int(df_comments["sentiment"].notna().sum())
+    sentiments = df_comments["sentiment"].dropna().tolist()
+    print(f"Checkpoint gevonden - hervat vanaf rij {start_i}")
+except:
+    df_comments["sentiment"] = None
+    sentiments = []
+    start_i = 0
+
+# Loop
+for i, comment in enumerate(df_comments["comment"][start_i:], start=start_i):
+    if i % 500 == 0:
+        print(f"[{i}/{len(df_comments)}] {100*i/len(df_comments):.1f}% compleet")
+        df_temp = df_comments.copy()
+        df_temp["sentiment"] = sentiments + [None] * (len(df_comments) - len(sentiments))
+        df_temp.to_csv(checkpoint_file, index=False)
+    
+    sentiments.append(get_sentiment(comment))
+
+# Definitief opslaan
+df_comments["sentiment"] = sentiments
+df_comments.to_csv("/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_with_sentiment.csv", index=False)
+
+print("\nKlaar!")
+print(df_comments["sentiment"].value_counts())
+
+comments_with_sentiment = pd.read_csv("/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_with_sentiment.csv")
+
+overzicht = comments_with_sentiment.groupby(["persoon", "gender"]).agg(totaal=("sentiment", "count"), negatief=("sentiment", lambda x: (x == "negative").sum())).reset_index()
+overzicht["pct_negatief"] = (overzicht["negatief"] / overzicht["totaal"] * 100).round(1)
+print(overzicht.sort_values("gender"))
+
+
+#statistische test voor verschil in negatieve sentimenten tussen mannen en vrouwen
+import pandas as pd
+from scipy.stats import chi2_contingency
+
+# Kruistabel
+kruistabel = pd.crosstab(comments_with_sentiment["gender"], comments_with_sentiment["sentiment"])
+print("Kruistabel:")
+print(kruistabel)
+
+# Chi-kwadraat toets
+chi2, p, dof, expected = chi2_contingency(kruistabel)
+print(f"\nChi-kwadraat: {chi2:.4f}")
+print(f"Vrijheidsgraden: {dof}")
+print(f"p-waarde: {p:.6f}")
+
+if p < 0.05:
+    print("✓ Significant verschil tussen mannen en vrouwen")
+else:
+    print("✗ Geen significant verschil tussen mannen en vrouwen")

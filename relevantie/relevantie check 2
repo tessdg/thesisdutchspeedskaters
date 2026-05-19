@@ -1,0 +1,93 @@
+from transformers import pipeline
+import pandas as pd
+import time
+
+# Model laden
+print("Model laden...")
+classifier = pipeline(
+    "zero-shot-classification",
+    model="MoritzLaurer/deberta-v3-large-zeroshot-v2.0"
+)
+print("Model geladen!")
+
+# CSV inladen
+df = pd.read_csv("/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_all_clean.csv")
+print(f"Totaal comments: {len(df)}")
+
+# Relevantie functie
+def check_relevance(comment, person, gender):
+    try:
+        comment = str(comment)[:500]
+        pronoun = "she/her" if gender == "vrouw" else "he/him"
+        
+        result = classifier(
+            comment,
+            candidate_labels=[
+                f"this comment evaluates or describes {person} ({pronoun})",
+                f"this comment is not about {person} or contains no evaluation"
+            ],
+            hypothesis_template="{}."
+        )
+        
+        best_label = result["labels"][0]
+        score = result["scores"][0]
+        
+        if score < 0.55:
+            return "unclear"
+        elif "evaluates or describes" in best_label:
+            return "relevant"
+        else:
+            return "not_relevant"
+            
+    except Exception as e:
+        print(f"  Fout: {e}")
+        return "unknown"
+
+# Checkpoint
+checkpoint_file = "/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/relevance_checkpoint.csv"
+
+try:
+    checkpoint = pd.read_csv(checkpoint_file)
+    df["relevance"] = checkpoint["relevance"]
+    start_i = int(df["relevance"].notna().sum())
+    print(f"Checkpoint gevonden - hervat vanaf rij {start_i}")
+except:
+    df["relevance"] = None
+    start_i = 0
+
+n = len(df)
+
+# Loop
+for i in range(start_i, n):
+    if i % 100 == 0:
+        print(f"[{i}/{n}] {100*i/n:.1f}% compleet")
+        df.to_csv(checkpoint_file, index=False)
+    
+    df.at[i, "relevance"] = check_relevance(
+        df["comment"].iloc[i],
+        df["persoon"].iloc[i],
+        df["gender"].iloc[i]
+    )
+
+# Definitief opslaan
+df.to_csv(checkpoint_file, index=False)
+
+# Overzicht
+print("\n========== RESULTATEN ==========")
+print(df["relevance"].value_counts())
+print("\nPer persoon:")
+print(df.groupby(["persoon", "gender"])["relevance"].value_counts())
+
+# Filter relevante comments
+df_relevant = df[df["relevance"] == "relevant"]
+print(f"\nOrigineel: {len(df)} comments")
+print(f"Relevant:  {len(df_relevant)} comments")
+print(f"Gefilterd: {len(df) - len(df_relevant)} comments")
+
+df_relevant.to_csv(
+    "/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_relevant.csv", 
+    index=False
+)
+print("\n✓ Opgeslagen: comments_relevant.csv")
+
+

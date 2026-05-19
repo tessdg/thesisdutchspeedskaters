@@ -1,0 +1,276 @@
+import requests
+import pandas as pd
+import time
+import json
+from datetime import datetime
+from typing import Dict, List, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+# Pushshift API endpoint
+PUSHSHIFT_URL = "https://api.pushshift.io/reddit"
+
+# ============================================================================
+# 1. EERST de functies definiëren
+# ============================================================================
+
+def search_threads(keywords: str, sort_by: str = "top", period: str = "all") -> pd.DataFrame:
+    """
+    Zoekt Reddit threads via Pushshift.
+    Retourneert DataFrame met url, title, subreddit, thread_id
+    """
+    threads = []
+    
+    # Map periode naar timestamp
+    period_map = {
+        'all': 0,
+        'year': 31536000,
+        'month': 2592000,
+        'week': 604800,
+        'day': 86400
+    }
+    
+    after = int(time.time()) - period_map.get(period, 0)
+    sort = 'score' if sort_by == 'top' else 'created_utc'
+    
+    print(f"  Zoeken op Pushshift: {keywords}")
+    
+    try:
+        # Pushshift submission search
+        url = f"{PUSHSHIFT_URL}/submission/search"
+        params = {
+            'q': keywords,
+            'after': after,
+            'sort': sort,
+            'sort_type': 'desc',
+            'size': 100
+        }
+        
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'data' in data:
+            for post in data['data']:
+                threads.append({
+                    'url': f"https://www.reddit.com{post.get('permalink', '')}",
+                    'title': post.get('title', ''),
+                    'subreddit': post.get('subreddit', ''),
+                    'thread_id': post.get('id', ''),
+                    'author': post.get('author', '[deleted]')
+                })
+        
+        print(f"  ✓ Gevonden: {len(threads)} threads\n")
+        return pd.DataFrame(threads)
+    
+    except Exception as e:
+        print(f"  ✗ Zoeken mislukt: {e}\n")
+        return pd.DataFrame()
+
+
+def get_thread_comments(thread_id: str, subreddit: str) -> List[Dict]:
+    """
+    Haalt comments via Pushshift.
+    Retourneert list met comment dicts
+    """
+    comments = []
+    
+    try:
+        url = f"{PUSHSHIFT_URL}/comment/search"
+        params = {
+            'link_id': f't3_{thread_id}',  # t3_ is prefix voor submissions
+            'size': 500
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'data' in data:
+            for comment in data['data']:
+                body = comment.get('body', '')
+                # Filter deleted en removed
+                if body and body not in ['[deleted]', '[removed]']:
+                    comments.append({
+                        'author': comment.get('author', '[deleted]'),
+                        'body': body,
+                        'score': comment.get('score', 0),
+                        'timestamp': comment.get('created_utc', 0),
+                        'comment_id': comment.get('id', '')
+                    })
+        
+        return comments
+    
+    except Exception as e:
+        print(f"    ✗ Fout bij ophalen comments: {str(e)[:80]}")
+        return []
+
+
+def process_person(threads: pd.DataFrame, naam: str, gender: str) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Verwerkt alle threads voor één persoon.
+    Retourneert (comments_df, failed_urls)
+    """
+    all_comments = []
+    failed_urls = []
+    
+    if threads.empty:
+        print(f"  ⚠ Geen threads gevonden voor {naam}")
+        return pd.DataFrame(), []
+    
+    for i, (idx, row) in enumerate(threads.iterrows(), 1):
+        url = row['url']
+        thread_id = row['thread_id']
+        subreddit = row['subreddit']
+        
+        try:
+            print(f"[{i}/{len(threads)}] Processing: {url}")
+            
+            # Probeer comments op te halen
+            comments = []
+            success = False
+            
+            for attempt in range(1, 4):
+                try:
+                    comments = get_thread_comments(thread_id, subreddit)
+                    if comments:
+                        success = True
+                        break
+                except Exception as e:
+                    print(f"    Poging {attempt} mislukt: {str(e)[:50]}")
+                
+                if attempt < 3 and not success:
+                    time.sleep(5)
+            
+            # Verwerk comments
+            if comments:
+                for comment in comments:
+                    comment['thread_url'] = url
+                    comment['thread_title'] = row['title']
+                    comment['subreddit'] = subreddit
+                    comment['persoon'] = naam
+                    comment['gender'] = gender
+                
+                all_comments.extend(comments)
+                print(f"  ✓ Added {len(comments)} comments")
+            else:
+                print(f"  ⚠ Geen comments gevonden")
+                failed_urls.append(url)
+            
+            time.sleep(2)  # Respecteer rate limits
+        
+        except Exception as e:
+            print(f"  ✗ Definitief mislukt: {str(e)[:50]}")
+            failed_urls.append(url)
+    
+    # Maak DataFrame
+    comments_df = pd.DataFrame(all_comments) if all_comments else pd.DataFrame()
+    
+    print(f"\n========== {naam.upper()} ==========")
+    print(f"✓ Totaal comments: {len(comments_df)}")
+    print(f"✗ Gefaald: {len(failed_urls)} van {len(threads)} URLs\n")
+    
+    return comments_df, failed_urls
+
+
+# ============================================================================
+# 2. DAN threads ophalen
+# ============================================================================
+
+print("Threads ophalen...\n")
+
+threads_ireen  = search_threads(keywords="Ireen Wüst",    sort_by="top", period="all")
+threads_femke  = search_threads(keywords="Femke Bol",     sort_by="top", period="all")
+threads_thomas = search_threads(keywords="Thomas Krol",   sort_by="top", period="all")
+threads_sven   = search_threads(keywords="Sven Kramer",   sort_by="top", period="all")
+threads_jutta  = search_threads(keywords="Jutta Leerdam", sort_by="top", period="all")
+threads_kjeld  = search_threads(keywords="Kjeld Nuis",    sort_by="top", period="all")
+
+print("✓ Threads opgehaald!\n")
+
+# ============================================================================
+# 3. DAN scrapen
+# ============================================================================
+
+print("Scrapen starten...\n")
+
+result_ireen  = process_person(threads_ireen,  "ireen",  "vrouw")
+result_femke  = process_person(threads_femke,  "femke",  "vrouw")
+result_thomas = process_person(threads_thomas, "thomas", "man")
+result_sven   = process_person(threads_sven,   "sven",   "man")
+result_jutta  = process_person(threads_jutta,  "jutta",  "vrouw")
+result_kjeld  = process_person(threads_kjeld,  "kjeld",  "man")
+
+# ============================================================================
+# 4. Uithalen
+# ============================================================================
+
+comments_ireen  = result_ireen[0]
+comments_femke  = result_femke[0]
+comments_thomas = result_thomas[0]
+comments_sven   = result_sven[0]
+comments_jutta  = result_jutta[0]
+comments_kjeld  = result_kjeld[0]
+
+failed_ireen  = result_ireen[1]
+failed_femke  = result_femke[1]
+failed_thomas = result_thomas[1]
+failed_sven   = result_sven[1]
+failed_jutta  = result_jutta[1]
+failed_kjeld  = result_kjeld[1]
+
+# ============================================================================
+# 5. Samenvoegen
+# ============================================================================
+
+comments_all = pd.concat([
+    comments_ireen, comments_femke, comments_thomas,
+    comments_sven, comments_jutta, comments_kjeld
+], ignore_index=True)
+
+# ============================================================================
+# 6. SAVE!
+# ============================================================================
+
+# Save als pickle voor latere Python-use
+comments_all.to_pickle("reddit_data.pkl")
+comments_ireen.to_pickle("comments_ireen.pkl")
+comments_femke.to_pickle("comments_femke.pkl")
+comments_thomas.to_pickle("comments_thomas.pkl")
+comments_sven.to_pickle("comments_sven.pkl")
+comments_jutta.to_pickle("comments_jutta.pkl")
+comments_kjeld.to_pickle("comments_kjeld.pkl")
+
+# ============================================================================
+# 7. Eindoverzicht
+# ============================================================================
+
+print("\n========== EINDOVERZICHT ==========\n")
+
+overzicht = pd.DataFrame({
+    'persoon': ["ireen", "femke", "thomas", "sven", "jutta", "kjeld"],
+    'gender': ["vrouw", "vrouw", "man", "man", "vrouw", "man"],
+    'comments': [
+        len(comments_ireen), len(comments_femke), len(comments_thomas),
+        len(comments_sven), len(comments_jutta), len(comments_kjeld)
+    ],
+    'gefaald': [
+        len(failed_ireen), len(failed_femke), len(failed_thomas),
+        len(failed_sven), len(failed_jutta), len(failed_kjeld)
+    ]
+})
+
+print(overzicht.to_string(index=False))
+print(f"\nTotaal: {len(comments_all)} comments over {len(overzicht)} personen\n")
+
+# ============================================================================
+# 8. Save als CSV
+# ============================================================================
+
+comments_all.to_csv("comments_all.csv", index=False)
+overzicht.to_csv("overzicht.csv", index=False)
+
+print("✓ Alles opgeslagen in:")
+print("  - reddit_data.pkl (alle dataframes)")
+print("  - comments_all.csv (alle comments)")
+print("  - overzicht.csv (samenvatting)")

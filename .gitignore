@@ -1,0 +1,29 @@
+# API keys
+.env
+
+# Data bestanden (niet op GitHub)
+*.csv
+*.RData
+*.rds
+*.xlsx
+*.parquet
+*.json
+
+# Checkpoints
+*checkpoint*
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# Mac
+.DS_Store
+
+# VS Code
+.vscode/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/

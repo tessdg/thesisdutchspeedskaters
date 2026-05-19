@@ -1,0 +1,104 @@
+"""
+Step 1: Clean and pre-filter comments before sending to the LLM.
+
+Removes:
+- Duplicate comments
+- Deleted/removed comments (exact and pattern-based)
+- Bot comments (AutoModerator etc.)
+- Empty or near-empty comments
+- Mass-deletion footers
+
+Adds helper columns:
+- name_in_comment: skater name mentioned in the comment
+- name_in_thread:  skater name mentioned in the thread title
+
+Output: comments_all_clean.csv  (input for step 2)
+        dropped_in_prefilter.csv (audit log of removed comments)
+"""
+
+import re
+from pathlib import Path
+
+import pandas as pd
+
+# ---- CONFIG -----------------------------------------------------------------
+_HERE       = Path(__file__).parent
+INPUT_CSV   = _HERE / ".." / "comments_all.csv"
+OUTPUT_CSV  = _HERE / ".." / "comments_all_clean.csv"
+DROPPED_CSV = _HERE / ".." / "dropped_in_prefilter.csv"
+
+SKATER_NAMES = {
+    "sven":   ["sven kramer", "kramer"],
+    "ireen":  ["ireen wust", "ireen wüst", "wust", "wüst"],
+    "jutta":  ["jutta leerdam", "leerdam"],
+    "kjeld":  ["kjeld nuis", "nuis"],
+    "thomas": ["thomas krol", "krol"],
+    "femke":  ["femke kok", "kok"],
+}
+
+BOT_AUTHORS = {
+    "AutoModerator", "automoderator", "[deleted]", "[removed]",
+    "RemindMeBot", "WikiTextBot", "sneakpeekbot",
+}
+
+DELETED_RE = re.compile(
+    r"^\[deleted\]$|^\[removed\]$|This post was mass deleted"
+    r"|This comment was removed|^\s*deleted\s*$|^\.\s*$",
+    re.IGNORECASE,
+)
+
+# ---- MAIN -------------------------------------------------------------------
+def main():
+    df = pd.read_csv(INPUT_CSV)
+    n_start = len(df)
+    print(f"Loaded {n_start:,} rows")
+
+    df["comment"]      = df["comment"].fillna("").astype(str)
+    df["thread_title"] = df["thread_title"].fillna("").astype(str)
+    df["drop_reason"]  = ""
+
+    # 1. Duplicaten verwijderen
+    before = len(df)
+    df = df.drop_duplicates(subset=["comment", "persoon", "author", "thread_url"], keep="first")
+    print(f"Duplicaten verwijderd: {before - len(df):,}")
+
+    # 2. Bot authors
+    mask = df["author"].isin(BOT_AUTHORS)
+    df.loc[mask & (df["drop_reason"] == ""), "drop_reason"] = "bot_author"
+
+    # 3. Deleted/removed tekst (regex, pakt meer dan alleen exacte matches)
+    mask = df["comment"].str.contains(DELETED_RE, na=False)
+    df.loc[mask & (df["drop_reason"] == ""), "drop_reason"] = "deleted_text"
+
+    # 4. Verwijder mass-deletion footers uit anders-goede comments
+    df["comment"] = df["comment"].str.replace(
+        r"\n*\*?This post was mass deleted.*?\*?$", "", regex=True
+    ).str.strip()
+
+    # Splitsen
+    kept    = df[df["drop_reason"] == ""].copy()
+    dropped = df[df["drop_reason"] != ""].copy()
+
+    # 6. Helper kolommen: staat de naam in de comment of thread?
+    def name_hits(row, field):
+        names = SKATER_NAMES.get(row["persoon"], [])
+        text = row[field].lower()
+        return any(n in text for n in names)
+
+    kept["name_in_comment"] = kept.apply(lambda r: name_hits(r, "comment"), axis=1)
+    kept["name_in_thread"]  = kept.apply(lambda r: name_hits(r, "thread_title"), axis=1)
+
+    kept = kept.drop(columns=["drop_reason"])
+    kept.to_csv(OUTPUT_CSV, index=False)
+    dropped.to_csv(DROPPED_CSV, index=False)
+
+    print(f"\nBehouden : {len(kept):,} ({len(kept)/n_start:.1%})")
+    print(f"Verwijderd: {len(dropped):,} ({len(dropped)/n_start:.1%})")
+    print("\nReden van verwijdering:")
+    print(dropped["drop_reason"].value_counts())
+    print(f"\nOpgeslagen: {OUTPUT_CSV}")
+    print(f"Audit log:  {DROPPED_CSV}")
+
+
+if __name__ == "__main__":
+    main()

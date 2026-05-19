@@ -1,0 +1,121 @@
+from transformers import pipeline
+import pandas as pd
+import time
+
+# Full names and pronouns per skater
+FULL_NAMES = {
+    "sven":   ("Sven Kramer",   "he/him"),
+    "jutta":  ("Jutta Leerdam", "she/her"),
+    "femke":  ("Femke Kok",     "she/her"),
+    "kjeld":  ("Kjeld Nuis",    "he/him"),
+    "thomas": ("Thomas Krol",   "he/him"),
+    "ireen":  ("Ireen Wüst",    "she/her"),
+}
+
+# Subreddits clearly not about Dutch speed skating.
+# For these, a comment only qualifies if the skater's full name appears in the text.
+IRRELEVANT_SUBS = {
+    # Soccer
+    "soccer", "fcbayern", "coys", "borussiadortmund", "Bundesliga",
+    "feyenoord", "MCFC", "schalke04", "OlympiqueLyonnais", "futebol",
+    "Eredivisie", "worldcup", "fcsp",
+    # Baseball
+    "baseball", "minnesotatwins", "angelsbaseball", "Braves",
+    # Football manager / gaming
+    "TOP5LEAGUESFM24SAVE", "FifaCareers", "WEPES", "UMF26",
+    # Clearly off-topic
+    "indieheads", "byzantium", "Games", "DCcomics", "Wolverine",
+    "CrusaderKings", "Magic", "oscarrace", "BareKnuckleFC",
+    "generationology", "conspiracy",
+}
+
+print("Model laden...")
+classifier = pipeline(
+    "zero-shot-classification",
+    model="MoritzLaurer/deberta-v3-large-zeroshot-v2.0"
+)
+print("Model geladen!")
+
+df = pd.read_csv("/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_all_clean.csv")
+print(f"Totaal comments: {len(df)}")
+
+
+
+def check_relevance(comment, persoon, subreddit):
+    full_name, pronoun = FULL_NAMES[persoon]
+    comment_str = str(comment)[:500]
+
+    if subreddit in IRRELEVANT_SUBS:
+        # Stricter: model uses full name so "Sven" in a soccer thread won't match
+        candidate_labels = [
+            f"this comment evaluates or describes {full_name}, Dutch speed skater ({pronoun})",
+            f"this comment is not about {full_name} or contains no evaluation of {full_name}"
+        ]
+    else:
+        # Relevant subreddit: first name is enough context, use original approach
+        candidate_labels = [
+            f"this comment evaluates or describes {persoon} ({pronoun})",
+            f"this comment is not about {persoon} or contains no evaluation"
+        ]
+
+    try:
+        result = classifier(comment_str, candidate_labels, hypothesis_template="{}.")
+        best_label = result["labels"][0]
+        score = result["scores"][0]
+
+        if score < 0.55:
+            return "unclear"
+        elif "evaluates or describes" in best_label:
+            return "relevant"
+        else:
+            return "not_relevant"
+
+    except Exception as e:
+        print(f"  Fout: {e}")
+        return "unknown"
+
+
+checkpoint_file = "/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/relevance_checkpoint_v2.csv"
+
+try:
+    checkpoint = pd.read_csv(checkpoint_file)
+    df["relevance"] = checkpoint["relevance"]
+    start_i = int(df["relevance"].notna().sum())
+    print(f"Checkpoint gevonden - hervat vanaf rij {start_i}")
+except:
+    df["relevance"] = None
+    start_i = 0
+
+n = len(df)
+start_time = time.time()
+
+for i in range(start_i, n):
+    if i % 100 == 0 and i > start_i:
+        elapsed = time.time() - start_time
+        remaining = (n - i) / (i - start_i) * elapsed / 60
+        print(f"[{i}/{n}] {100*i/n:.1f}% — nog ~{remaining:.0f} min")
+        df.to_csv(checkpoint_file, index=False)
+
+    df.at[i, "relevance"] = check_relevance(
+        df["comment"].iloc[i],
+        df["persoon"].iloc[i],
+        df["subreddit"].iloc[i]
+    )
+
+df.to_csv(checkpoint_file, index=False)
+
+print("\n========== RESULTATEN ==========")
+print(df["relevance"].value_counts())
+print("\nPer persoon:")
+print(df.groupby(["persoon", "gender"])["relevance"].value_counts())
+
+df_relevant = df[df["relevance"] == "relevant"]
+print(f"\nOrigineel:  {len(df)} comments")
+print(f"Relevant:   {len(df_relevant)} comments")
+print(f"Gefilterd:  {len(df) - len(df_relevant)} comments")
+
+df_relevant.to_csv(
+    "/Users/tessdegraaf/Documents/VS/BachlorScriptie VS/comments_relevant_v2.csv",
+    index=False
+)
+print("\n✓ Opgeslagen: comments_relevant_v2.csv")
